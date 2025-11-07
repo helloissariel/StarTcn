@@ -1,0 +1,16 @@
+# Ignore large or generated datasets
+ADBench_datasets/
+UCR_Anomaly_FullData/
+KPI_npz/
+saved_models/
+logs/
+__pycache__/
+*.pyc 
+__pycache__/utils.cpython-310.pyc
+prepare_ucr_pretrain.py
+ADBench_datasets
+data/iops_competition/phase2_train.csv
+data/iops_competition/phase2_test.csv
+pretrain.py
+logs/
+Drafts/
