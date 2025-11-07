@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import classification_report, roc_auc_score
 import numpy as np
+import math
 
 # =========================
 # 1. Load & Utility Functions
@@ -144,6 +145,166 @@ def train_detector(model, train_loader, optimizer, criterion, device):
     return total_loss / len(train_loader)
 
 
+# =========================
+# Perturbation Loss Components
+# =========================
+
+def mse_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Per-sample mean squared distance between tensors a and b."""
+    if a.shape != b.shape:
+        raise ValueError("Inputs to mse_distance must share the same shape")
+    if a.dim() == 1:
+        return torch.square(a - b)
+    reduction_dims = tuple(range(1, a.dim()))
+    return torch.mean(torch.square(a - b), dim=reduction_dims)
+
+
+def perturbation_loss(
+    x: torch.Tensor,
+    x_recon: torch.Tensor,
+    x_tilde: torch.Tensor,
+    delta_min: float = 0.1,
+    delta_max: float = 1.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Triplet-style perturbation loss encouraging synthetic anomalies to be distinct yet realistic.
+
+    Args:
+        x: Original normal samples (B, ...).
+        x_recon: Reconstructions of x (B, ...).
+        x_tilde: Synthetic anomalous samples (B, ...).
+        delta_min: Minimum separation margin between reconstructions and anomalies.
+        delta_max: Maximum allowed distance for anomalies to stay plausible.
+        reduction: "mean", "sum", or "none" for per-batch aggregation.
+    """
+    if not (x.shape == x_recon.shape == x_tilde.shape):
+        raise ValueError("All inputs to perturbation_loss must share the same shape")
+
+    dist_pos = mse_distance(x, x_recon)
+    dist_neg = mse_distance(x, x_tilde)
+
+    triplet_term = torch.clamp(dist_pos - dist_neg + delta_min, min=0.0)
+    regularization_term = torch.clamp(dist_neg - delta_max, min=0.0)
+    loss = triplet_term + regularization_term
+
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    if reduction == "none":
+        return loss
+    raise ValueError("reduction must be 'mean', 'sum', or 'none'")
+
+
+# =========================
+# Zero-value Perturbation Loss
+# =========================
+
+def zero_perturbation_loss(
+    x: torch.Tensor,
+    x_tilde: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Encourage meaningful deviations on zero-valued dimensions of x."""
+    if x.shape != x_tilde.shape:
+        raise ValueError("Inputs to zero_perturbation_loss must share the same shape")
+
+    flat_x = x.view(x.size(0), -1)
+    flat_tilde = x_tilde.view(x_tilde.size(0), -1)
+    mask = (flat_x == 0.0).float()
+    zero_counts = mask.sum(dim=1)
+
+    per_element_dist = torch.square(flat_x - flat_tilde)
+    masked_dist = per_element_dist * mask
+
+    seq_length = x.size(1) if x.dim() > 1 else 1
+
+    eps = 1e-8
+    normalized = masked_dist.sum(dim=1) / (seq_length * (zero_counts + eps))
+    loss = torch.pow(normalized + 1.0, -1)
+
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    if reduction == "none":
+        return loss
+    raise ValueError("reduction must be 'mean', 'sum', or 'none'")
+
+
+# =========================
+# Enhanced KL Divergence Loss
+# =========================
+
+def enhanced_kl_loss(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    sigma_prior: float = 0.5,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """KL regularizer against tightened Gaussian prior N(0, sigma_prior^2)."""
+    if sigma_prior <= 0:
+        raise ValueError("sigma_prior must be positive")
+    if mu.shape != logvar.shape:
+        raise ValueError("mu and logvar must share the same shape")
+
+    var = torch.exp(logvar)
+    prior_var = sigma_prior ** 2
+    log_sigma_prior = math.log(sigma_prior)
+
+    elements = 1 + logvar - mu.pow(2) - (var / prior_var) + 2 * log_sigma_prior
+    per_sample = -0.5 * torch.sum(elements, dim=1)
+
+    if reduction == "mean":
+        return per_sample.mean()
+    if reduction == "sum":
+        return per_sample.sum()
+    if reduction == "none":
+        return per_sample
+    raise ValueError("reduction must be 'mean', 'sum', or 'none'")
+
+
+def total_anomaly_vae_loss(
+    x: torch.Tensor,
+    x_recon: torch.Tensor,
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    x_tilde: torch.Tensor = None,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    gamma: float = 1.0,
+    zeta: float = 1.0,
+    delta_min: float = 0.1,
+    delta_max: float = 1.0,
+    sigma_prior: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Combine reconstruction, perturbation, zero-perturbation, and enhanced KL losses."""
+    recon = F.mse_loss(x_recon, x, reduction="mean")
+    total = alpha * recon
+
+    if x_tilde is not None:
+        perturb = perturbation_loss(
+            x=x,
+            x_recon=x_recon,
+            x_tilde=x_tilde,
+            delta_min=delta_min,
+            delta_max=delta_max,
+            reduction="mean",
+        )
+        zero = zero_perturbation_loss(x=x, x_tilde=x_tilde, reduction="mean")
+        total = total + beta * perturb + gamma * zero
+    else:
+        device = x.device if isinstance(x, torch.Tensor) else "cpu"
+        perturb = torch.tensor(0.0, device=device)
+        zero = torch.tensor(0.0, device=device)
+
+    kl = enhanced_kl_loss(mu=mu, logvar=logvar, sigma_prior=sigma_prior, reduction="mean")
+    total = total + zeta * kl
+
+    return total, recon, perturb, zero, kl
+
+
 # Để tái lập trình ngẫu nhiên cho ví dụ
 torch.manual_seed(0)
 np.random.seed(0)
@@ -201,14 +362,20 @@ def One_Step_To_Feasible_Action(
     # Encode input data into latent space
     with torch.no_grad():
         mean, logvar = beta_cvae.encode(x_orig, y_class1)
-        z = beta_cvae.reparameterize(mean, logvar).detach().clone()
 
-    # Optimize latent space representation
-    optimizer_z = torch.optim.Adam([z], lr=lr)
+    mu = mean.detach()
+    sigma = torch.exp(0.5 * logvar).detach()
+    epsilon = torch.randn_like(sigma)
+
+    psi_param = torch.zeros_like(sigma, requires_grad=True)
+    optimizer_psi = torch.optim.Adam([psi_param], lr=lr)
+
     for step in range(steps):
-        optimizer_z.zero_grad()
+        optimizer_psi.zero_grad()
 
-        # Decode latent variable back to data space
+        psi = torch.exp(psi_param)
+        z = mu + psi * (sigma * epsilon)
+
         x_synthetic = beta_cvae.decode(z, y_class1)
 
         # Calculate detector prediction
@@ -225,13 +392,23 @@ def One_Step_To_Feasible_Action(
         # Calculate total reward (inverse objective)
         inv_reward = prob_class1.mean() + lambda_div * diversity_term
         inv_reward.backward()
-        optimizer_z.step()
+        optimizer_psi.step()
 
-    print(f"Deceiving Detector Reward: {1/ (prob_class1.item()+0.0001):.4f}",
-          f"Diversity reward: {1/(diversity_term+0.0001):.4f}",
-          f"Sample reward: {1/(inv_reward.item()+0.0001):.4f}")
+    psi = torch.exp(psi_param).detach()
+    z_final = mu + psi * (sigma * epsilon)
+
+    diversity_value = (
+        diversity_term.detach().item() if isinstance(diversity_term, torch.Tensor) else float(diversity_term)
+    )
+
+    print(
+        f"Deceiving Detector Reward: {1 / (prob_class1.item() + 1e-4):.4f}",
+        f"Diversity reward: {1 / (diversity_value + 1e-4):.4f}",
+        f"Sample reward: {1 / (inv_reward.item() + 1e-4):.4f}",
+        f"Psi mean: {psi.mean().item():.4f}"
+    )
 
     # Decode optimized latent variable back to data space
     with torch.no_grad():
-        x_adv = beta_cvae.decode(z, y_class1).detach().cpu().squeeze(0)
+        x_adv = beta_cvae.decode(z_final, y_class1).detach().cpu().squeeze(0)
     return x_adv

@@ -173,6 +173,8 @@ class MixtureOfExperts(nn.Module):
 
 
 class PolicyNetwork(nn.Module):
+    """Simple MLP policy that outputs latent offsets."""
+
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(PolicyNetwork, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
@@ -180,12 +182,9 @@ class PolicyNetwork(nn.Module):
         self.fc3 = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
-        # x shape: (batch_size, input_dim)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        # Đầu ra của policy chính là modified z (dạng vector)
-        x = self.fc3(x)
-        return x
+        return self.fc3(x)
 
 
 class ValueNetwork(nn.Module):
@@ -213,6 +212,7 @@ class PPOTrainer:
             clip_epsilon=0.2,
             value_coefficient=0.5,
             entropy_coefficient=0.01,
+            action_std=0.5,
             device="cpu"
     ):
         self.device = device
@@ -227,6 +227,11 @@ class PPOTrainer:
         self.clip_epsilon = clip_epsilon
         self.value_coefficient = value_coefficient
         self.entropy_coefficient = entropy_coefficient
+        self.action_std = action_std
+
+    def _normal_dist(self, mean: torch.Tensor) -> torch.distributions.Normal:
+        std = torch.ones_like(mean) * self.action_std
+        return torch.distributions.Normal(mean, std)
 
     def get_action_and_log_prob(self, state):
         """
@@ -235,12 +240,10 @@ class PPOTrainer:
             action (modified_z): shape [batch_size, output_dim]
             log_prob: shape [batch_size, 1]
         """
-        with torch.no_grad():
-            action = self.policy_net(state)
-        # Ở đây tạm coi action là continuous => log_prob = -||action||^2/2 (ví dụ)
-        # Hoặc ta có thể dùng Normal distribution, v.v.
-        # Minh hoạ đơn giản:
-        log_prob = -0.5 * torch.sum(action ** 2, dim=-1, keepdim=True)
+        mean = self.policy_net(state)
+        dist = self._normal_dist(mean)
+        action = dist.rsample()
+        log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)
         return action, log_prob
 
     def compute_advantages(self, rewards, values, next_values, dones):
@@ -258,8 +261,9 @@ class PPOTrainer:
         """
         for _ in range(n_epochs):
             # ----- TÍNH LẠI log_prob mới -----
-            new_actions = self.policy_net(states)  # new_actions ~ policy(state)
-            new_log_probs = -0.5 * torch.sum(new_actions ** 2, dim=-1, keepdim=True)
+            mean = self.policy_net(states)
+            dist = self._normal_dist(mean)
+            new_log_probs = dist.log_prob(actions).sum(dim=-1, keepdim=True)
 
             # Tính tỷ lệ r = exp(new_log_prob - old_log_prob)
             ratio = torch.exp(new_log_probs - old_log_probs)
@@ -274,26 +278,19 @@ class PPOTrainer:
             values_pred = self.value_net(states)
             value_loss = F.mse_loss(values_pred, returns)
 
-            # Entropy (ở đây tạm thời ta coi -||new_actions||^2/2 như log_prob => entropy có thể tính thủ công)
-            # Hoặc có thể thay thế bằng phân phối liên tục (Normal), v.v.
-            entropy = 0.5 * torch.mean(torch.sum(new_actions ** 2, dim=-1))
+            entropy = dist.entropy().sum(dim=-1).mean()
 
             # Tổng loss
             total_loss = policy_loss \
                          + self.value_coefficient * value_loss \
                          - self.entropy_coefficient * entropy
 
-            # Update Policy
+            # Update networks
             self.policy_optimizer.zero_grad()
+            self.value_optimizer.zero_grad()
             total_loss.backward()
             self.policy_optimizer.step()
-
-            # Update Value
-            # => Ở đây ta đã gộp chung backward, tuỳ bạn tách ra hay gộp
-            # Thường tách ra cho rõ ràng:
-            #   self.value_optimizer.zero_grad()
-            #   value_loss.backward()
-            #   self.value_optimizer.step()
+            self.value_optimizer.step()
 
     def train_step(self, data_distributions, z_vectors, batch_size=32, n_epochs=4):
         """
@@ -310,9 +307,7 @@ class PPOTrainer:
 
         # ----- Rollout -----
         with torch.no_grad():
-            actions = self.policy_net(states)
-            # log_prob cũ
-            old_log_probs = -0.5 * torch.sum(actions ** 2, dim=-1, keepdim=True)
+            actions, old_log_probs = self.get_action_and_log_prob(states)
             values = self.value_net(states)
 
         rewards = compute_diversity_reward(actions)
