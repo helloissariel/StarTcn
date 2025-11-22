@@ -424,13 +424,16 @@ def main(
         episode_states: List[torch.Tensor] = []
         episode_actions: List[torch.Tensor] = []
         episode_log_probs: List[torch.Tensor] = []
+        rl_perturb_loss = 0.0
+        rl_zero_loss = 0.0
+        rl_updates = 0
 
         for _ in range(num_gen_windows):
             random_idx = random.choice(idx_class1)
-            base_window = current_windows[random_idx]
+            base_window = current_windows[random_idx].unsqueeze(0).to(device)
             y_target = torch.full((1, 1), 0.8, device=device)
             with torch.no_grad():
-                mu, logvar = tcn_vae.encode(base_window.unsqueeze(0).to(device), y_target)
+                mu, logvar = tcn_vae.encode(base_window, y_target)
 
             mu = mu.squeeze(0)
             logvar = logvar.squeeze(0)
@@ -444,7 +447,8 @@ def main(
             z = mu + delta * std
 
             with torch.no_grad():
-                adv_window = tcn_vae.decode(z.unsqueeze(0), y_target).detach().cpu().squeeze(0)
+                adv_window_device = tcn_vae.decode(z.unsqueeze(0), y_target).detach()
+            adv_window = adv_window_device.cpu().squeeze(0)
 
             generated_windows.append(adv_window.unsqueeze(0))
             generated_labels.append(torch.ones(1, 1))
@@ -452,6 +456,31 @@ def main(
             episode_states.append(state_vec.detach())
             episode_actions.append(action_vec.detach())
             episode_log_probs.append(log_prob_vec.detach())
+
+            # Reinforce VAE with perturbation/zero losses using the generated window
+            tcn_vae.train()
+            recon_train, mu_train, logvar_train = tcn_vae(base_window, y_target)
+            loss_rl, _, perturb_l, zero_l, _ = total_anomaly_vae_loss(
+                x=base_window,
+                x_recon=recon_train,
+                mu=mu_train,
+                logvar=logvar_train,
+                x_tilde=adv_window_device,
+                alpha=alpha_recon,
+                beta=beta_perturb,
+                gamma=gamma_zero,
+                zeta=zeta_en_kl,
+                delta_min=delta_min,
+                delta_max=delta_max,
+                sigma_prior=sigma_prior,
+            )
+            optimizer_vae.zero_grad()
+            loss_rl.backward()
+            optimizer_vae.step()
+
+            rl_perturb_loss += float(perturb_l.item())
+            rl_zero_loss += float(zero_l.item())
+            rl_updates += 1
 
         if generated_windows:
             new_windows = torch.cat(generated_windows, dim=0)
@@ -496,6 +525,14 @@ def main(
                 )
         else:
             print("  No synthetic windows generated this episode.")
+
+        if rl_updates:
+            avg_perturb = rl_perturb_loss / rl_updates
+            avg_zero = rl_zero_loss / rl_updates
+            print(
+                f"  RL-stage VAE updates: {rl_updates}, "
+                f"avg perturb={avg_perturb:.6f}, avg zero={avg_zero:.6f}"
+            )
 
     # Final detector training on augmented dataset
     flattened_features = current_windows.reshape(current_windows.size(0), -1)

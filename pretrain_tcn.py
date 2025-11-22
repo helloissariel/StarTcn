@@ -416,10 +416,10 @@ def main(
                 )
             print(message)
 
-        metric_loss = val_metrics["loss"] if val_metrics is not None else avg_loss
+        monitored_value = val_metrics["recon"] if val_metrics is not None else avg_recon
 
-        if metric_loss < best_metric - early_stop_min_delta:
-            best_metric = metric_loss
+        if monitored_value < best_metric - early_stop_min_delta:
+            best_metric = monitored_value
             epochs_since_improve = 0
         else:
             epochs_since_improve += 1
@@ -427,7 +427,7 @@ def main(
         if early_stop_patience > 0 and epochs_since_improve >= early_stop_patience:
             print(
                 f"[TCN-VAE] Early stopping at epoch {epoch + 1} after no improvement for {early_stop_patience} epochs\n"
-                f"            Best monitored loss: {best_metric:.4f}"
+                f"            Best monitored val_recon: {best_metric:.4f}"
             )
             break
 

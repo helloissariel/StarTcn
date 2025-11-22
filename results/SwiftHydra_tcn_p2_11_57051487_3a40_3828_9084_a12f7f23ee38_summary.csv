@@ -1,0 +1,24 @@
+,SwiftHydraTCN_0
+Dataset,p2_11_57051487_3a40_3828_9084_a12f7f23ee38
+Affiliation Precision,0.77588
+Affiliation Recall,1.0
+Affiliation F1,0.8738
+Affiliation Threshold,2.97
+Affiliation Epoch,44
+RPA Precision,0.13043
+RPA Recall,1.0
+RPA F1,0.23077
+RPA Threshold,2.97
+RPA Epoch,44
+RPA True Anomalies,15
+RPA Predicted Anomalies,35
+PA Precision,0.42857
+PA Recall,1.0
+PA F1,0.6
+PA Threshold,2.97
+PA Epoch,44
+Point-wise Precision,0.42857
+Point-wise Recall,1.0
+Point-wise F1,0.6
+Point-wise Threshold,2.97
+Point-wise Epoch,44
